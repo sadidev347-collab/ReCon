@@ -1,10 +1,7 @@
 #pragma once
 
 #include <juce_audio_processors/juce_audio_processors.h>
-
-#if (MSVC)
-#include "ipps.h"
-#endif
+#include <juce_dsp/juce_dsp.h>
 
 class PluginProcessor : public juce::AudioProcessor
 {
@@ -14,16 +11,12 @@ public:
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
-
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
-
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override;
-
     const juce::String getName() const override;
-
     bool acceptsMidi() const override;
     bool producesMidi() const override;
     bool isMidiEffect() const override;
@@ -38,6 +31,21 @@ public:
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
+    static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+
+    bool loadImpulseResponse (const juce::File& file);
+    bool savePreset (const juce::File& file);
+    bool loadPreset (const juce::File& file);
+    juce::String getImpulseResponseName() const;
+
+    juce::AudioProcessorValueTreeState apvts;
+
 private:
+    juce::dsp::Convolution convolution;
+    juce::AudioBuffer<float> dryBuffer;
+    juce::File impulseResponseFile;
+    double currentSampleRate = 44100.0;
+    int preparedBlockSize = 0;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginProcessor)
 };

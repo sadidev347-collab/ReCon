@@ -1,28 +1,53 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
-//==============================================================================
+namespace
+{
+constexpr auto intensityId = "intensity";
+constexpr auto mixId = "mix";
+constexpr auto impulseResponsePath = "impulseResponsePath";
+}
+
 PluginProcessor::PluginProcessor()
-     : AudioProcessor (BusesProperties()
+    : AudioProcessor (BusesProperties()
                      #if ! JucePlugin_IsMidiEffect
                       #if ! JucePlugin_IsSynth
-                       .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                       .withInput ("Input", juce::AudioChannelSet::stereo(), true)
                       #endif
                        .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
                      #endif
-                       )
+                       ),
+      apvts (*this, nullptr, "ReConState", createParameterLayout())
 {
 }
 
-PluginProcessor::~PluginProcessor()
+PluginProcessor::~PluginProcessor() = default;
+
+juce::AudioProcessorValueTreeState::ParameterLayout PluginProcessor::createParameterLayout()
 {
+    juce::AudioProcessorValueTreeState::ParameterLayout layout;
+
+    const auto percentageAttributes = []
+    {
+        return juce::AudioParameterFloatAttributes()
+            .withStringFromValueFunction ([] (float value, int)
+                                          { return juce::String (juce::roundToInt (value * 100.0f)) + "%"; })
+            .withValueFromStringFunction ([] (const juce::String& text)
+                                          { return text.getFloatValue() / 100.0f; });
+    };
+
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        intensityId, "Reverb Intensity", juce::NormalisableRange<float> (0.0f, 1.0f), 0.75f,
+        percentageAttributes()));
+
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        mixId, "Dry / Wet Mix", juce::NormalisableRange<float> (0.0f, 1.0f), 0.35f,
+        percentageAttributes()));
+
+    return layout;
 }
 
-//==============================================================================
-const juce::String PluginProcessor::getName() const
-{
-    return JucePlugin_Name;
-}
+const juce::String PluginProcessor::getName() const { return JucePlugin_Name; }
 
 bool PluginProcessor::acceptsMidi() const
 {
@@ -53,29 +78,18 @@ bool PluginProcessor::isMidiEffect() const
 
 double PluginProcessor::getTailLengthSeconds() const
 {
-    return 0.0;
+    return currentSampleRate > 0.0
+               ? static_cast<double> (convolution.getCurrentIRSize()) / currentSampleRate
+               : 0.0;
 }
 
-int PluginProcessor::getNumPrograms()
-{
-    return 1;   // NB: some hosts don't cope very well if you tell them there are 0 programs,
-                // so this should be at least 1, even if you're not really implementing programs.
-}
-
-int PluginProcessor::getCurrentProgram()
-{
-    return 0;
-}
-
-void PluginProcessor::setCurrentProgram (int index)
-{
-    juce::ignoreUnused (index);
-}
+int PluginProcessor::getNumPrograms() { return 1; }
+int PluginProcessor::getCurrentProgram() { return 0; }
+void PluginProcessor::setCurrentProgram (int index) { juce::ignoreUnused (index); }
 
 const juce::String PluginProcessor::getProgramName (int index)
 {
     juce::ignoreUnused (index);
-    // Steinberg's VST3 validator fails plugins whose single default program has no name
     return "Default";
 }
 
@@ -84,78 +98,137 @@ void PluginProcessor::changeProgramName (int index, const juce::String& newName)
     juce::ignoreUnused (index, newName);
 }
 
-//==============================================================================
 void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    // Use this method as the place to do any pre-playback
-    // initialisation that you need..
-    juce::ignoreUnused (sampleRate, samplesPerBlock);
+    currentSampleRate = sampleRate;
+    preparedBlockSize = samplesPerBlock;
+    dryBuffer.setSize (2, samplesPerBlock, false, false, true);
+
+    juce::dsp::ProcessSpec spec;
+    spec.sampleRate = sampleRate;
+    spec.maximumBlockSize = static_cast<juce::uint32> (samplesPerBlock);
+    spec.numChannels = 2;
+    convolution.prepare (spec);
+    convolution.reset();
+
+    if (impulseResponseFile.existsAsFile())
+        loadImpulseResponse (impulseResponseFile);
 }
 
 void PluginProcessor::releaseResources()
 {
-    // When playback stops, you can use this as an opportunity to free up any
-    // spare memory, etc.
+    convolution.reset();
 }
 
 bool PluginProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
-  #if JucePlugin_IsMidiEffect
+   #if JucePlugin_IsMidiEffect
     juce::ignoreUnused (layouts);
     return true;
-  #else
-    // This is the place where you check if the layout is supported.
-    // In this template code we only support mono or stereo.
-    if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::mono()
-     && layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
+   #else
+    const auto output = layouts.getMainOutputChannelSet();
+    if (output != juce::AudioChannelSet::mono() && output != juce::AudioChannelSet::stereo())
         return false;
 
-    // This checks if the input layout matches the output layout
-   #if ! JucePlugin_IsSynth
-    if (layouts.getMainOutputChannelSet() != layouts.getMainInputChannelSet())
+    #if ! JucePlugin_IsSynth
+    if (output != layouts.getMainInputChannelSet())
         return false;
-   #endif
-
+    #endif
     return true;
-  #endif
+   #endif
 }
 
-void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
-                                              juce::MidiBuffer& midiMessages)
+void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
 {
     juce::ignoreUnused (midiMessages);
-
     juce::ScopedNoDenormals noDenormals;
-    auto totalNumInputChannels  = getTotalNumInputChannels();
-    auto totalNumOutputChannels = getTotalNumOutputChannels();
 
-    // In case we have more outputs than inputs, this code clears any output
-    // channels that didn't contain input data, (because these aren't
-    // guaranteed to be empty - they may contain garbage).
-    // This is here to avoid people getting screaming feedback
-    // when they first compile a plugin, but obviously you don't need to keep
-    // this code if your algorithm always overwrites all the output channels.
-    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
-        buffer.clear (i, 0, buffer.getNumSamples());
+    const auto numSamples = buffer.getNumSamples();
+    const auto numChannels = juce::jmin (2, buffer.getNumChannels());
+    if (numChannels == 0 || numSamples == 0)
+        return;
 
-    // This is the place where you'd normally do the guts of your plugin's
-    // audio processing...
-    // Make sure to reset the state if your inner loop is processing
-    // the samples and the outer loop is handling the channels.
-    // Alternatively, you can process the samples with the channels
-    // interleaved by keeping the same state.
-    for (int channel = 0; channel < totalNumInputChannels; ++channel)
+    if (numSamples > preparedBlockSize)
     {
-        auto* channelData = buffer.getWritePointer (channel);
-        juce::ignoreUnused (channelData);
-        // ..do something to the data...
+        buffer.clear();
+        return;
     }
+
+    for (int channel = 0; channel < numChannels; ++channel)
+        dryBuffer.copyFrom (channel, 0, buffer, channel, 0, numSamples);
+
+    juce::dsp::AudioBlock<float> block (buffer);
+    convolution.process (juce::dsp::ProcessContextReplacing<float> (block));
+
+    const auto intensity = apvts.getRawParameterValue (intensityId)->load();
+    const auto mix = apvts.getRawParameterValue (mixId)->load();
+    const auto wetGain = intensity * mix;
+    const auto dryGain = 1.0f - mix;
+
+    buffer.applyGain (wetGain);
+    for (int channel = 0; channel < numChannels; ++channel)
+        buffer.addFrom (channel, 0, dryBuffer, channel, 0, numSamples, dryGain);
 }
 
-//==============================================================================
-bool PluginProcessor::hasEditor() const
+bool PluginProcessor::loadImpulseResponse (const juce::File& file)
 {
-    return true; // (change this to false if you choose to not supply an editor)
+    if (! file.existsAsFile() || file.getFileExtension().toLowerCase() != ".wav")
+        return false;
+
+    impulseResponseFile = file;
+    convolution.loadImpulseResponse (file,
+                                     juce::dsp::Convolution::Stereo::yes,
+                                     juce::dsp::Convolution::Trim::yes,
+                                     0,
+                                     juce::dsp::Convolution::Normalise::yes);
+    apvts.state.setProperty (impulseResponsePath, file.getFullPathName(), nullptr);
+    return true;
+}
+
+juce::String PluginProcessor::getImpulseResponseName() const
+{
+    return impulseResponseFile.existsAsFile() ? impulseResponseFile.getFileName()
+                                              : "No impulse response loaded";
+}
+
+bool PluginProcessor::savePreset (const juce::File& file)
+{
+    auto state = apvts.copyState();
+    std::unique_ptr<juce::XmlElement> xml (state.createXml());
+    return xml != nullptr && xml->writeTo (file);
+}
+
+bool PluginProcessor::loadPreset (const juce::File& file)
+{
+    if (! file.existsAsFile())
+        return false;
+
+    auto xml = juce::XmlDocument::parse (file);
+    if (xml == nullptr)
+        return false;
+
+    apvts.replaceState (juce::ValueTree::fromXml (*xml));
+    const auto path = apvts.state.getProperty (impulseResponsePath).toString();
+    return path.isEmpty() || loadImpulseResponse (juce::File (path));
+}
+
+void PluginProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    std::unique_ptr<juce::XmlElement> xml (apvts.copyState().createXml());
+    if (xml != nullptr)
+        copyXmlToBinary (*xml, destData);
+}
+
+void PluginProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    std::unique_ptr<juce::XmlElement> xml (getXmlFromBinary (data, sizeInBytes));
+    if (xml == nullptr)
+        return;
+
+    apvts.replaceState (juce::ValueTree::fromXml (*xml));
+    const auto path = apvts.state.getProperty (impulseResponsePath).toString();
+    if (path.isNotEmpty())
+        loadImpulseResponse (juce::File (path));
 }
 
 juce::AudioProcessorEditor* PluginProcessor::createEditor()
@@ -163,24 +236,8 @@ juce::AudioProcessorEditor* PluginProcessor::createEditor()
     return new PluginEditor (*this);
 }
 
-//==============================================================================
-void PluginProcessor::getStateInformation (juce::MemoryBlock& destData)
-{
-    // You should use this method to store your parameters in the memory block.
-    // You could do that either as raw data, or use the XML or ValueTree classes
-    // as intermediaries to make it easy to save and load complex data.
-    juce::ignoreUnused (destData);
-}
+bool PluginProcessor::hasEditor() const { return true; }
 
-void PluginProcessor::setStateInformation (const void* data, int sizeInBytes)
-{
-    // You should use this method to restore your parameters from this memory block,
-    // whose contents will have been created by the getStateInformation() call.
-    juce::ignoreUnused (data, sizeInBytes);
-}
-
-//==============================================================================
-// This creates new instances of the plugin..
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new PluginProcessor();
